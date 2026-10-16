@@ -27,27 +27,34 @@ export class BackgroundService {
   async init(): Promise<void> {
     if (this.isInitialized) return;
 
-    const profile = await this.profileRepo.getProfile();
-    const correctionsMap = await this.correctionsRepo.getCorrectionsMap();
-    const currentDate = this.clock.getLocalDateString();
-    const enforcementState = await this.enforcementRepo.getEnforcementState(currentDate);
-    const todayRecords = await this.ledgerRepo.getRecordsForDate(currentDate);
+    try {
+      const profile = await this.profileRepo.getProfile();
+      console.log(`[FocusFeed:Storage] Loaded profile "${profile.id}" (v${profile.version}) with ${profile.categories.length} categories`);
+      const correctionsMap = await this.correctionsRepo.getCorrectionsMap();
+      const currentDate = this.clock.getLocalDateString();
+      const enforcementState = await this.enforcementRepo.getEnforcementState(currentDate);
+      const todayRecords = await this.ledgerRepo.getRecordsForDate(currentDate);
 
-    this.engine = new PolicyEngine({
-      profile,
-      classifier: this.classifier,
-      clock: this.clock,
-      corrections: correctionsMap
-    });
+      this.engine = new PolicyEngine({
+        profile,
+        classifier: this.classifier,
+        clock: this.clock,
+        corrections: correctionsMap
+      });
 
-    this.ledger = new CreditLedger({
-      clock: this.clock,
-      config: enforcementState.config,
-      records: todayRecords,
-      blockedUntil: enforcementState.blockedUntil
-    });
+      this.ledger = new CreditLedger({
+        clock: this.clock,
+        config: enforcementState.config,
+        records: todayRecords,
+        blockedUntil: enforcementState.blockedUntil
+      });
 
-    this.isInitialized = true;
+      console.log(`[FocusFeed:Classifier] Initialized ${this.classifier.name} (v${this.classifier.version})`);
+      this.isInitialized = true;
+    } catch (err) {
+      console.error('[FocusFeed:Storage] Failed to initialize storage repositories:', err);
+      throw err;
+    }
   }
 
   async handleMessage(rawMessage: unknown): Promise<unknown> {
@@ -56,7 +63,7 @@ export class BackgroundService {
     // Validate incoming message schema
     const parsed = ExtensionMessageSchema.safeParse(rawMessage);
     if (!parsed.success) {
-      console.error('[FocusFeed] Invalid message schema:', parsed.error);
+      console.error('[FocusFeed:Policy] Invalid message schema:', parsed.error);
       return { error: 'INVALID_MESSAGE_PAYLOAD', details: parsed.error.issues };
     }
 
@@ -70,11 +77,13 @@ export class BackgroundService {
         // 1. Check cache first
         const cached = this.cache.get(video.id, profile.version, video.surface);
         if (cached) {
+          console.debug(`[FocusFeed:Policy] Cache hit for "${video.title.slice(0, 30)}": [${cached.decision.toUpperCase()}]`);
           return cached;
         }
 
         // 2. Evaluate through PolicyEngine
         const decision = await this.engine.evaluate(video);
+        console.log(`[FocusFeed:Policy] Evaluated "${video.title.slice(0, 30)}": [${decision.decision.toUpperCase()}] (${decision.reasonCode})`);
 
         // 3. Cache result
         this.cache.set(video.id, decision, profile.version, video.surface);

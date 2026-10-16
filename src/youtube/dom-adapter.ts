@@ -23,19 +23,42 @@ export class YouTubeDomAdapter {
   }
 
   /**
+   * Tests whether an element is itself a YouTube video card container.
+   */
+  isCardElement(element: HTMLElement): boolean {
+    if (!element || typeof element.matches !== 'function') return false;
+    return element.matches(YOUTUBE_SELECTORS.cardContainers);
+  }
+
+  /**
    * Extracts clean, structured metadata from a video card DOM element.
    */
   extractMetadata(card: HTMLElement, surface: SurfaceType): VideoMetadata | null {
     // 1. Extract link and Video ID
+    let href = '';
     const linkEl = card.querySelector<HTMLAnchorElement>(YOUTUBE_SELECTORS.videoLinkSelectors);
-    const href = linkEl?.getAttribute('href') || '';
+    if (linkEl) {
+      href = linkEl.getAttribute('href') || linkEl.href || '';
+    }
+
+    // Fallback: search all links in the card
+    if (!href) {
+      const allLinks = card.querySelectorAll<HTMLAnchorElement>('a[href]');
+      for (const a of allLinks) {
+        const h = a.getAttribute('href') || '';
+        if (h.includes('/watch?v=') || h.includes('/shorts/')) {
+          href = h;
+          break;
+        }
+      }
+    }
 
     let videoId = '';
-    const watchMatch = href.match(/(?:\/watch\?v=|\/shorts\/)([a-zA-Z0-9_-]{11})/);
-    if (watchMatch) {
-      videoId = watchMatch[1];
+    const match = href.match(/(?:[?&]v=|\/shorts\/|\/embed\/|\/watch\/)([a-zA-Z0-9_-]{11})/);
+    if (match) {
+      videoId = match[1];
     } else {
-      // Try attribute
+      // Try attributes on the card itself
       const idAttr = card.getAttribute('data-video-id') || card.getAttribute('id');
       if (idAttr && idAttr.length === 11) {
         videoId = idAttr;
@@ -55,17 +78,35 @@ export class YouTubeDomAdapter {
       ''
     ).replace(/\s+/g, ' ');
 
+    // Fallback title from card attributes if inner title element was empty
+    if (!title || title.length < 2) {
+      title = (
+        card.getAttribute('aria-label') ||
+        linkEl?.getAttribute('aria-label') ||
+        linkEl?.getAttribute('title') ||
+        ''
+      ).replace(/\s+/g, ' ');
+    }
+
     // 3. Extract Channel Name
     const channelEl = card.querySelector<HTMLElement>(YOUTUBE_SELECTORS.channelSelectors);
-    const channelName = (channelEl?.textContent?.trim() || '').replace(/\s+/g, ' ');
+    let channelName = (channelEl?.textContent?.trim() || '').replace(/\s+/g, ' ');
 
-    return {
+    if (!channelName) {
+      // Try aria-label or byline
+      const byline = card.querySelector<HTMLElement>('#byline, .byline, #owner-name');
+      channelName = (byline?.textContent?.trim() || 'YouTube Creator').replace(/\s+/g, ' ');
+    }
+
+    const metadata: VideoMetadata = {
       id: videoId,
       title: title || 'Untitled Video',
       channelName: channelName || 'YouTube Creator',
       surface,
       url: `https://www.youtube.com/watch?v=${videoId}`
     };
+
+    return metadata;
   }
 
   /**
@@ -75,6 +116,7 @@ export class YouTubeDomAdapter {
     card.style.setProperty('display', 'none', 'important');
     card.setAttribute('data-focusfeed-status', 'hidden');
     card.setAttribute('data-focusfeed-reason', reasonCode);
+    console.debug(`[FocusFeed:DOM] Card hidden: [${reasonCode}]`);
   }
 
   /**
@@ -88,6 +130,7 @@ export class YouTubeDomAdapter {
     if (matchedRule) {
       card.setAttribute('data-focusfeed-rule', matchedRule);
     }
+    console.debug(`[FocusFeed:DOM] Card allowed: [${matchedRule || 'in-interest'}]`);
   }
 
   /**

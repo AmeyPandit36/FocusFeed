@@ -8,8 +8,22 @@ import { client } from '../src/messaging/client';
 export default defineContentScript({
   matches: ['*://*.youtube.com/*'],
   runAt: 'document_idle',
-  main() {
-    console.log('[FocusFeed] Content script initializing on YouTube...');
+  async main() {
+    console.log('[FocusFeed:Init] Content script initializing on YouTube...');
+
+    // 1. Verify extension background messaging and retrieve state
+    try {
+      const state = await client.getCurrentState();
+      console.log(
+        `[FocusFeed:Init] Extension connection verified. Protection: [${
+          state.config.enabled ? 'ENABLED' : 'PAUSED'
+        }], Active Categories: ${state.profile.categories.length}, Credits: ${
+          state.creditState.remaining
+        }/${state.creditState.allowance}`
+      );
+    } catch (err) {
+      console.error('[FocusFeed:Init] Failed to communicate with background service worker:', err);
+    }
 
     const domAdapter = new YouTubeDomAdapter();
     const navObserver = new NavigationObserver(domAdapter);
@@ -27,8 +41,8 @@ export default defineContentScript({
     });
 
     // Handle SPA navigation events
-    navObserver.start((_url, surface) => {
-      console.log(`[FocusFeed] Navigated to surface: ${surface}`);
+    navObserver.start((url, surface) => {
+      console.log(`[FocusFeed:DOM] Navigated to surface: [${surface}] (${url})`);
       feedProcessor.resetCounts();
       playbackGuard.guardCurrentPagePlayback();
     });
@@ -37,14 +51,15 @@ export default defineContentScript({
     feedProcessor.start();
     playbackGuard.start();
 
-    // Listen for external extension updates (e.g. profile update from popup or settings)
+    // Listen for external extension updates
     chrome.runtime?.onMessage?.addListener((msg) => {
       if (msg?.type === 'PROFILE_UPDATED' || msg?.type === 'REPROCESS_FEED') {
+        console.log('[FocusFeed:DOM] Received update event, reprocessing feed...');
         feedProcessor.reprocessAll();
         playbackGuard.guardCurrentPagePlayback();
       }
     });
 
-    console.log('[FocusFeed] Feed protection active');
+    console.log('[FocusFeed:Init] Content script initialization complete. Feed protection active.');
   }
 });

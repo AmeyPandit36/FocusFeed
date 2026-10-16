@@ -1,18 +1,19 @@
 import { YouTubeDomAdapter } from './dom-adapter';
-import type { SurfaceType, PolicyDecision } from '../core/types';
+import type { SurfaceType, PolicyDecision, VideoMetadata } from '../core/types';
 
 export interface FeedProcessorOptions {
   domAdapter?: YouTubeDomAdapter;
-  evaluateVideo: (video: import('../core/types').VideoMetadata) => Promise<PolicyDecision>;
+  evaluateVideo: (video: VideoMetadata) => Promise<PolicyDecision>;
   getSurface: () => SurfaceType;
 }
 
 export class FeedProcessor {
   private domAdapter: YouTubeDomAdapter;
-  private evaluateVideo: (video: import('../core/types').VideoMetadata) => Promise<PolicyDecision>;
+  private evaluateVideo: (video: VideoMetadata) => Promise<PolicyDecision>;
   private getSurface: () => SurfaceType;
 
   private observer: MutationObserver | null = null;
+  private pollInterval: number | null = null;
   private debounceTimer: number | null = null;
   private processingQueue: Set<HTMLElement> = new Set();
   private isProcessing = false;
@@ -29,46 +30,66 @@ export class FeedProcessor {
   start(): void {
     if (this.observer || typeof document === 'undefined') return;
 
-    // Initial scan of existing video cards
-    this.scheduleBatchProcess(this.domAdapter.findVideoCards(document));
+    this.injectGlobalStyles();
+    this.injectStatusIndicator();
 
-    // Observe subtree for dynamically inserted video cards
+    // 1. Initial scan of existing video cards
+    this.scanDocumentCards();
+
+    // 2. Observe subtree for dynamically inserted video cards
     this.observer = new MutationObserver((mutations) => {
       const candidates: HTMLElement[] = [];
+
       for (const mutation of mutations) {
         for (let i = 0; i < mutation.addedNodes.length; i++) {
           const node = mutation.addedNodes[i];
           if (node instanceof HTMLElement) {
             // Check if node itself is a video card
-            if (this.domAdapter.isCardProcessed(node)) continue;
+            if (this.domAdapter.isCardElement(node)) {
+              if (!this.domAdapter.isCardProcessed(node)) {
+                candidates.push(node);
+              }
+            }
 
-            const cards = this.domAdapter.findVideoCards(node);
-            if (cards.length > 0) {
-              candidates.push(...cards);
-            } else if (node.matches && node.matches(this.domAdapter.findVideoCards.name)) {
-              candidates.push(node);
+            // Check if node contains child video cards
+            const childCards = this.domAdapter.findVideoCards(node);
+            for (const card of childCards) {
+              if (!this.domAdapter.isCardProcessed(card)) {
+                candidates.push(card);
+              }
             }
           }
         }
       }
 
       if (candidates.length > 0) {
+        console.debug(`[FocusFeed:DOM] MutationObserver discovered ${candidates.length} candidate card(s)`);
         this.scheduleBatchProcess(candidates);
       }
     });
 
-    this.observer.observe(document.body || document.documentElement, {
+    const target = document.body || document.documentElement;
+    this.observer.observe(target, {
       childList: true,
       subtree: true
     });
 
-    this.injectStatusIndicator();
+    // 3. Fallback polling for virtualized rows and SPA content
+    this.pollInterval = window.setInterval(() => {
+      this.scanDocumentCards();
+    }, 1200);
+
+    console.log('[FocusFeed:DOM] Feed observer & background poller initialized');
   }
 
   stop(): void {
     if (this.observer) {
       this.observer.disconnect();
       this.observer = null;
+    }
+    if (this.pollInterval !== null) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
     }
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer);
@@ -86,6 +107,7 @@ export class FeedProcessor {
 
   reprocessAll(): void {
     if (typeof document === 'undefined') return;
+    console.log('[FocusFeed:DOM] Reprocessing all video cards on page...');
     const cards = this.domAdapter.findVideoCards(document);
     for (const card of cards) {
       card.removeAttribute('data-focusfeed-status');
@@ -94,6 +116,16 @@ export class FeedProcessor {
     }
     this.resetCounts();
     this.scheduleBatchProcess(cards);
+  }
+
+  private scanDocumentCards(): void {
+    if (typeof document === 'undefined') return;
+    const cards = this.domAdapter.findVideoCards(document);
+    const unhandled = cards.filter((c) => !this.domAdapter.isCardProcessed(c));
+    if (unhandled.length > 0) {
+      console.debug(`[FocusFeed:DOM] Poller discovered ${unhandled.length} unhandled video card(s)`);
+      this.scheduleBatchProcess(unhandled);
+    }
   }
 
   private scheduleBatchProcess(cards: HTMLElement[]): void {
@@ -107,10 +139,10 @@ export class FeedProcessor {
       clearTimeout(this.debounceTimer);
     }
 
-    // Debounce processing to batch DOM reads and avoids stuttering
+    // Debounce processing to batch DOM reads and avoid stuttering
     this.debounceTimer = window.setTimeout(() => {
       this.processQueue();
-    }, 60);
+    }, 80);
   }
 
   private async processQueue(): Promise<void> {
@@ -121,21 +153,26 @@ export class FeedProcessor {
     this.processingQueue.clear();
     const surface = this.getSurface();
 
+    console.debug(`[FocusFeed:DOM] Processing batch of ${cardsToProcess.length} cards for surface [${surface}]`);
+
     for (const card of cardsToProcess) {
       if (this.domAdapter.isCardProcessed(card)) continue;
 
       const metadata = this.domAdapter.extractMetadata(card, surface);
       if (!metadata) {
-        // Not enough data yet (e.g. YouTube DOM still rendering inner elements)
-        // Keep in queue for next debounced cycle if still connected
+        // Retry if still attached to DOM (title might be rendering)
         if (card.isConnected) {
           this.processingQueue.add(card);
         }
         continue;
       }
 
+      console.debug(`[FocusFeed:Metadata] Extracted: "${metadata.title}" [${metadata.channelName}] (${metadata.id})`);
+
       try {
         const decision = await this.evaluateVideo(metadata);
+        console.log(`[FocusFeed:Policy] Decision for "${metadata.title.slice(0, 40)}...": [${decision.decision.toUpperCase()}] (${decision.reasonCode})`);
+
         if (decision.decision === 'allowed') {
           this.domAdapter.showCard(card, decision.matchedRule);
           this.allowedCount++;
@@ -145,13 +182,35 @@ export class FeedProcessor {
           this.hiddenCount++;
         }
       } catch (err) {
-        console.error('[FocusFeed] Error evaluating video:', err);
+        console.error('[FocusFeed:Policy] Error evaluating video:', err);
       }
     }
 
     this.isProcessing = false;
     this.updateStatusIndicator();
     this.checkAndRenderEmptyState();
+  }
+
+  private injectGlobalStyles(): void {
+    if (typeof document === 'undefined' || document.getElementById('focusfeed-global-styles')) return;
+
+    const style = document.createElement('style');
+    style.id = 'focusfeed-global-styles';
+    style.textContent = `
+      [data-focusfeed-status="hidden"] {
+        display: none !important;
+        visibility: hidden !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        max-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        overflow: hidden !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
   }
 
   private injectStatusIndicator(): void {
@@ -233,7 +292,7 @@ export class FeedProcessor {
       </div>
     `;
 
-    const feedRoot = document.querySelector('ytd-rich-grid-renderer, ytd-search');
+    const feedRoot = document.querySelector('ytd-rich-grid-renderer, ytd-search, ytm-rich-grid-renderer, ytm-search');
     if (feedRoot) {
       feedRoot.prepend(emptyContainer);
     }
