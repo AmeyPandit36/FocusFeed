@@ -69,23 +69,38 @@ export class YouTubeDomAdapter {
       return null;
     }
 
-    // 2. Extract Video Title
-    const titleEl = card.querySelector<HTMLElement>(YOUTUBE_SELECTORS.titleSelectors);
-    let title = (
-      titleEl?.textContent?.trim() ||
-      titleEl?.getAttribute('title') ||
-      titleEl?.getAttribute('aria-label') ||
-      ''
-    ).replace(/\s+/g, ' ');
+    // 2. Extract Video Title in priority order
+    let title = '';
+    for (const selector of YOUTUBE_SELECTORS.titleSelectors) {
+      const el = card.querySelector<HTMLElement>(selector);
+      if (el) {
+        const text = (
+          el.textContent?.trim() ||
+          el.getAttribute('title') ||
+          el.getAttribute('aria-label') ||
+          ''
+        ).replace(/\s+/g, ' ');
 
-    // Fallback title from card attributes if inner title element was empty
+        // Discard duration timestamps like "4:30" or "1:15:20"
+        if (text && text.length > 1 && !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(text)) {
+          title = text;
+          break;
+        }
+      }
+    }
+
+    // Fallback: search link attributes or card attributes
     if (!title || title.length < 2) {
-      title = (
+      const fallback = (
         card.getAttribute('aria-label') ||
         linkEl?.getAttribute('aria-label') ||
         linkEl?.getAttribute('title') ||
         ''
       ).replace(/\s+/g, ' ');
+
+      if (fallback && !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(fallback)) {
+        title = fallback;
+      }
     }
 
     // 3. Extract Channel Name
@@ -114,6 +129,10 @@ export class YouTubeDomAdapter {
    */
   hideCard(card: HTMLElement, reasonCode: string): void {
     card.style.setProperty('display', 'none', 'important');
+    card.style.setProperty('visibility', 'hidden', 'important');
+    card.style.setProperty('height', '0px', 'important');
+    card.style.setProperty('margin', '0px', 'important');
+    card.style.setProperty('padding', '0px', 'important');
     card.setAttribute('data-focusfeed-status', 'hidden');
     card.setAttribute('data-focusfeed-reason', reasonCode);
     console.debug(`[FocusFeed:DOM] Card hidden: [${reasonCode}]`);
@@ -123,9 +142,11 @@ export class YouTubeDomAdapter {
    * Marks and displays an allowed in-interest video card.
    */
   showCard(card: HTMLElement, matchedRule?: string): void {
-    if (card.style.display === 'none') {
-      card.style.removeProperty('display');
-    }
+    card.style.removeProperty('display');
+    card.style.removeProperty('visibility');
+    card.style.removeProperty('height');
+    card.style.removeProperty('margin');
+    card.style.removeProperty('padding');
     card.setAttribute('data-focusfeed-status', 'allowed');
     if (matchedRule) {
       card.setAttribute('data-focusfeed-rule', matchedRule);
@@ -142,9 +163,13 @@ export class YouTubeDomAdapter {
 
   /**
    * Finds all candidate video card elements within a container or root.
+   * Discards nested child cards so only outermost containers are controlled.
    */
   findVideoCards(root: ParentNode = document): HTMLElement[] {
-    const list = root.querySelectorAll<HTMLElement>(YOUTUBE_SELECTORS.cardContainers);
-    return Array.from(list);
+    const list = Array.from(root.querySelectorAll<HTMLElement>(YOUTUBE_SELECTORS.cardContainers));
+    return list.filter((el) => {
+      const parentCard = el.parentElement?.closest<HTMLElement>(YOUTUBE_SELECTORS.cardContainers);
+      return !parentCard;
+    });
   }
 }

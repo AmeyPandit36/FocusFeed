@@ -26,14 +26,13 @@ export const YOUTUBE_SELECTORS = {
     '#video-title-link',
     'a#video-title',
     'yt-formatted-string#video-title',
+    'h3.media-item-headline',
+    '.media-item-headline',
     '.title-and-badge h3 a',
     'h3 a#video-title',
     'h3 a',
-    'h3.media-item-headline',
-    '.media-item-headline',
-    'h3',
-    '.yt-core-attributed-string'
-  ].join(','),
+    'h3'
+  ],
 
   // Channel Name / Owner Selectors
   channelSelectors: [

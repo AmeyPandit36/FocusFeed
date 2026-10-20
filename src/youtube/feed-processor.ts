@@ -1,4 +1,5 @@
 import { YouTubeDomAdapter } from './dom-adapter';
+import { YOUTUBE_SELECTORS } from './selectors';
 import type { SurfaceType, PolicyDecision, VideoMetadata } from '../core/types';
 
 export interface FeedProcessorOptions {
@@ -16,6 +17,7 @@ export class FeedProcessor {
   private pollInterval: number | null = null;
   private debounceTimer: number | null = null;
   private processingQueue: Set<HTMLElement> = new Set();
+  private retryMap: WeakMap<HTMLElement, number> = new WeakMap();
   private isProcessing = false;
 
   private hiddenCount = 0;
@@ -44,9 +46,10 @@ export class FeedProcessor {
         for (let i = 0; i < mutation.addedNodes.length; i++) {
           const node = mutation.addedNodes[i];
           if (node instanceof HTMLElement) {
-            // Check if node itself is a video card
+            // Check if node itself is a video card (and not nested in an outer card)
             if (this.domAdapter.isCardElement(node)) {
-              if (!this.domAdapter.isCardProcessed(node)) {
+              const parentCard = node.parentElement?.closest<HTMLElement>(YOUTUBE_SELECTORS.cardContainers);
+              if (!parentCard && !this.domAdapter.isCardProcessed(node)) {
                 candidates.push(node);
               }
             }
@@ -153,33 +156,71 @@ export class FeedProcessor {
     this.processingQueue.clear();
     const surface = this.getSurface();
 
-    console.debug(`[FocusFeed:DOM] Processing batch of ${cardsToProcess.length} cards for surface [${surface}]`);
+    const discovered = cardsToProcess.length;
+    let validMetadataCount = 0;
+    let invalidMetadataCount = 0;
+    let allowedCountBatch = 0;
+    let blockedCountBatch = 0;
+    let uncertainCountBatch = 0;
+    let hiddenCountBatch = 0;
+    const representativeDecisions: Array<{
+      title: string;
+      channel: string;
+      decision: string;
+      reasonCode: string;
+      matchedRule?: string;
+    }> = [];
+
+    console.debug(`[FocusFeed:DOM] Processing batch of ${discovered} cards for surface [${surface}]`);
 
     for (const card of cardsToProcess) {
       if (this.domAdapter.isCardProcessed(card)) continue;
 
       const metadata = this.domAdapter.extractMetadata(card, surface);
       if (!metadata) {
-        // Retry if still attached to DOM (title might be rendering)
-        if (card.isConnected) {
+        const retries = this.retryMap.get(card) || 0;
+        if (retries < 3 && card.isConnected) {
+          this.retryMap.set(card, retries + 1);
           this.processingQueue.add(card);
+        } else {
+          // After 3 failed attempts, card is a promo banner, shelf header, or non-video slot
+          card.setAttribute('data-focusfeed-status', 'unsupported');
         }
+        invalidMetadataCount++;
         continue;
       }
 
-      console.debug(`[FocusFeed:Metadata] Extracted: "${metadata.title}" [${metadata.channelName}] (${metadata.id})`);
+      validMetadataCount++;
 
       try {
         const decision = await this.evaluateVideo(metadata);
-        console.log(`[FocusFeed:Policy] Decision for "${metadata.title.slice(0, 40)}...": [${decision.decision.toUpperCase()}] (${decision.reasonCode})`);
 
         if (decision.decision === 'allowed') {
           this.domAdapter.showCard(card, decision.matchedRule);
           this.allowedCount++;
-        } else {
-          // 'blocked' or 'uncertain'
+          allowedCountBatch++;
+        } else if (decision.decision === 'blocked') {
           this.domAdapter.hideCard(card, decision.reasonCode);
           this.hiddenCount++;
+          blockedCountBatch++;
+          hiddenCountBatch++;
+        } else {
+          // 'uncertain'
+          this.domAdapter.hideCard(card, decision.reasonCode);
+          this.hiddenCount++;
+          uncertainCountBatch++;
+          hiddenCountBatch++;
+        }
+
+        // Collect up to 4 representative decisions for reporting
+        if (representativeDecisions.length < 4) {
+          representativeDecisions.push({
+            title: metadata.title,
+            channel: metadata.channelName,
+            decision: decision.decision,
+            reasonCode: decision.reasonCode,
+            matchedRule: decision.matchedRule
+          });
         }
       } catch (err) {
         console.error('[FocusFeed:Policy] Error evaluating video:', err);
@@ -187,8 +228,33 @@ export class FeedProcessor {
     }
 
     this.isProcessing = false;
+
+    // Diagnostic scan summary log (Item 2)
+    console.log(
+      `[FocusFeed:ScanSummary] Scan batch complete on [${surface}]: ` +
+      `Discovered=${discovered}, ValidMetadata=${validMetadataCount}, Invalid/Retrying=${invalidMetadataCount} | ` +
+      `Allowed=${allowedCountBatch}, Blocked=${blockedCountBatch}, Uncertain=${uncertainCountBatch} | ` +
+      `ActuallyHidden=${hiddenCountBatch} (Totals: Hidden=${this.hiddenCount}, Allowed=${this.allowedCount})`
+    );
+
+    if (representativeDecisions.length > 0) {
+      console.log(
+        '[FocusFeed:ScanSummary] Representative Decisions:\n' +
+        representativeDecisions
+          .map((d) => `  * [${d.decision.toUpperCase()}] "${d.title.slice(0, 45)}" [${d.channel.slice(0, 25)}] -> ${d.reasonCode}${d.matchedRule ? ` (${d.matchedRule})` : ''}`)
+          .join('\n')
+      );
+    }
+
     this.updateStatusIndicator();
     this.checkAndRenderEmptyState();
+
+    // Schedule next debounced pass if retry cards were queued
+    if (this.processingQueue.size > 0 && !this.debounceTimer) {
+      this.debounceTimer = window.setTimeout(() => {
+        this.processQueue();
+      }, 350);
+    }
   }
 
   private injectGlobalStyles(): void {
@@ -203,6 +269,9 @@ export class FeedProcessor {
         height: 0 !important;
         min-height: 0 !important;
         max-height: 0 !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        max-width: 0 !important;
         margin: 0 !important;
         padding: 0 !important;
         opacity: 0 !important;
